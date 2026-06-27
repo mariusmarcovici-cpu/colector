@@ -26,6 +26,14 @@ GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 PM_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 PM_RECV_TIMEOUT_S = 10.0
+# [recorder fix] A passive recorder is NOT trading, so it does NOT need the bot's fast 10s stall-detection.
+# The bot's poly_stream survives a 10s timeout only because it subscribes to markets it actively trades
+# (constant book updates reset the timer). A recorder sitting on quieter markets falls through to the
+# keepalive — and with ping==timeout==10s the silence-timeout RACES the PONG and reconnects every ~20s.
+# Give the recorder a long silence-timeout: only reconnect on a GENUINELY dead socket; a quiet-but-live
+# market just sits idle and stays connected so we capture the continuous stream when it does flow.
+PM_RECORD_RECV_TIMEOUT_S = float(os.environ.get("PM_RECORD_RECV_TIMEOUT", "120"))
+PM_RECORD_PING_S = float(os.environ.get("PM_RECORD_PING", "5"))   # keepalive well inside the timeout window
 WS_BACKOFF_CAP_S = 20.0
 
 
@@ -149,6 +157,7 @@ async def run_recorder(save_dir, slug_prefix="btc-updown-5m", refresh_s=60, log=
     sub = set(await _discover_active_tokens(slug_prefix))
     last_refresh = time.time()
     attempt = 0
+    _events = [0]   # mutable counter visible to the inner loop (events captured this session)
 
     def _writer_path():
         return os.path.join(save_dir, f"pm_record_{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d_%H')}Z.jsonl")
@@ -166,18 +175,18 @@ async def run_recorder(save_dir, slug_prefix="btc-updown-5m", refresh_s=60, log=
                 await asyncio.sleep(3); continue
             async with websockets.connect(PM_WS, ping_interval=None, close_timeout=5) as ws:
                 await ws.send(json.dumps({"type": "market", "assets_ids": list(sub), "custom_feature_enabled": True}))
-                log(f"[pm-record] subscribed {len(sub)} tokens")
+                log(f"[pm-record] subscribed {len(sub)} tokens (recv-timeout {PM_RECORD_RECV_TIMEOUT_S:.0f}s)")
                 got = False
 
                 async def _ping():
                     while True:
-                        await asyncio.sleep(10)
+                        await asyncio.sleep(PM_RECORD_PING_S)
                         try: await ws.send("PING")
                         except: return
                 pt = asyncio.ensure_future(_ping())
                 try:
                     while not (stop_event and stop_event.is_set()):
-                        raw = await asyncio.wait_for(ws.recv(), timeout=PM_RECV_TIMEOUT_S)
+                        raw = await asyncio.wait_for(ws.recv(), timeout=PM_RECORD_RECV_TIMEOUT_S)
                         if not got:
                             got = True; attempt = 0
                         if raw == "PONG":
@@ -185,6 +194,9 @@ async def run_recorder(save_dir, slug_prefix="btc-updown-5m", refresh_s=60, log=
                         rec = {"recv_ts": time.time(), "raw": raw}
                         with open(_writer_path(), "a") as f:
                             f.write(json.dumps(rec) + "\n")
+                        _events[0] += 1
+                        if _events[0] % 250 == 0:   # positive confirmation that data IS being captured
+                            log(f"[pm-record] captured {_events[0]} events -> {os.path.basename(_writer_path())}")
                         # opportunistic re-discovery check without blocking the recv loop hard
                         if time.time() - last_refresh > refresh_s:
                             fresh = set(await _discover_active_tokens(slug_prefix))
@@ -196,7 +208,7 @@ async def run_recorder(save_dir, slug_prefix="btc-updown-5m", refresh_s=60, log=
                     pt.cancel()
         except asyncio.TimeoutError:
             attempt += 1; d = _ws_backoff(attempt)
-            log(f"[pm-record] recv stalled >{PM_RECV_TIMEOUT_S}s -> reconnect in {d:.1f}s")
+            log(f"[pm-record] no frames >{PM_RECORD_RECV_TIMEOUT_S:.0f}s (likely dead socket) -> reconnect in {d:.1f}s")
             await asyncio.sleep(d)
         except Exception as e:
             attempt += 1; d = _ws_backoff(attempt)
