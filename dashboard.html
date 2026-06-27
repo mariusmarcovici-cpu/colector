@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AMSA Data Collector</title>
+<style>
+  :root{--bg:#0a0e16;--panel:#0e1320;--line:#1b2433;--line2:#26344a;--txt:#dbe4f0;--muted:#7f8ea6;
+    --accent:#3b82f6;--green:#10b981;--amber:#f59e0b;--red:#ef4444;--mono:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font-family:var(--mono);font-size:13px;line-height:1.5}
+  .wrap{max-width:920px;margin:0 auto;padding:22px}
+  h1{font-size:17px;margin:0 0 2px} .sub{color:var(--muted);font-size:11px;margin-bottom:18px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+  .panel h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 12px}
+  .row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--line)}
+  .row:last-child{border-bottom:none}
+  .nm{color:var(--txt)} .sz{color:var(--muted);font-size:11px;margin-right:12px}
+  .btn{font-size:10px;font-weight:600;padding:5px 11px;border:1px solid var(--line2);border-radius:5px;
+    color:var(--muted);text-transform:uppercase;letter-spacing:.05em;text-decoration:none;background:#0c111c;
+    cursor:pointer;transition:all .15s}
+  .btn:hover{border-color:var(--accent);color:var(--accent)}
+  .btn.go{border-color:#1c3a5e;color:#93c5fd}
+  .btn.go:hover{background:#0c1c30}
+  .pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:10px;font-weight:600;text-transform:uppercase}
+  .pill.idle{background:#1a2230;color:var(--muted)} .pill.run{background:#10241a;color:var(--green)}
+  .pill.serving{background:#0c1c30;color:#93c5fd}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
+  .stat{background:#0b0f17;border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .stat .k{color:var(--muted);font-size:10px;text-transform:uppercase} .stat .v{font-size:18px;margin-top:3px}
+  .banner{border:1px solid #4a3410;background:#1a1206;color:#fcd34d;border-radius:8px;padding:11px 14px;font-size:11.5px;margin-bottom:16px}
+  .regime{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .rtag{padding:3px 10px;border-radius:6px;font-size:11px;border:1px solid var(--line2)}
+  .rtag.TREND{color:#86efac;border-color:#1c5132} .rtag.CHOP{color:#fca5a5;border-color:#5b2026} .rtag.MIXED{color:#cbd5e1}
+  #logbox{background:#070a10;border:1px solid var(--line);border-radius:8px;padding:10px;height:170px;overflow:auto;
+    font-size:11px;color:#9fb0c9;white-space:pre-wrap}
+  .topbtns{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+  .empty{color:var(--muted);font-size:12px;padding:6px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AMSA Data Collector</h1>
+  <div class="sub">Binance week backfill · Polymarket forward recorder · standalone — not the trading bot</div>
+
+  <div class="banner">
+    <b>Heads up on Polymarket:</b> the 5-minute markets are ephemeral and Polymarket's price-history returns
+    empty below 12h fidelity for resolved markets — so the <b>retroactive</b> PM pull yields ~nothing.
+    Real PM book/tape only comes from the <b>forward recorder</b> (record-only WebSocket → JSONL). Binance history is fully real.
+  </div>
+
+  <div class="topbtns">
+    <button class="btn go" onclick="runBackfill()">↻ Run backfill now</button>
+    <button class="btn go" onclick="startRecorder()">● Start PM forward recorder</button>
+    <a class="btn" href="/api/download_all">⬇ Download ALL (zip)</a>
+  </div>
+
+  <div class="panel">
+    <h2>Status</h2>
+    <div class="grid" id="stats"></div>
+    <div class="regime" id="regime"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Collected files</h2>
+    <div id="files"><div class="empty">Loading…</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Log</h2>
+    <div id="logbox"></div>
+  </div>
+</div>
+
+<script>
+function fmtBytes(n){n=n||0;if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(2)+' GB';}
+function phasePill(p){
+  if(p==='serving') return '<span class="pill serving">serving</span>';
+  if(p==='idle') return '<span class="pill idle">idle</span>';
+  return '<span class="pill run">'+(p||'').replace(/_/g,' ')+'</span>';
+}
+async function refresh(){
+  let s; try{ s=await (await fetch('/api/status',{cache:'no-store'})).json(); }catch(e){ return; }
+  // stats
+  const bf=s.backfill||{}, reg=bf.regime_counts||{};
+  const stats=[
+    ['Phase', phasePill(s.phase)],
+    ['Uptime', (s.uptime_s||0)+'s'],
+    ['1m klines', (bf.klines_1m||0).toLocaleString()],
+    ['1s klines', (bf.klines_1s||0).toLocaleString()],
+    ['aggTrades', (bf.aggtrades||0).toLocaleString()],
+    ['5-min windows', (bf.summary_windows||0).toLocaleString()],
+    ['PM recorder', s.pm_record_running?'<span style="color:#86efac">recording</span>':'<span style="color:#7f8ea6">off</span>'],
+  ];
+  document.getElementById('stats').innerHTML = stats.map(([k,v])=>
+    `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  // regime breakdown
+  const rdiv=document.getElementById('regime');
+  if(Object.keys(reg).length){
+    rdiv.innerHTML = '<span style="color:#7f8ea6;font-size:11px;margin-right:4px">regime mix:</span>'+
+      Object.entries(reg).map(([k,v])=>`<span class="rtag ${k}">${k}: ${v}</span>`).join('');
+  } else rdiv.innerHTML='';
+  // files
+  const fdiv=document.getElementById('files');
+  if(s.files && s.files.length){
+    fdiv.innerHTML = s.files.map(f=>
+      `<div class="row"><span class="nm">${f.name}</span>
+        <span><span class="sz">${fmtBytes(f.size)}</span>
+        <a class="btn" href="/api/download?f=${encodeURIComponent(f.name)}">⬇</a></span></div>`).join('');
+  } else fdiv.innerHTML='<div class="empty">No files yet — backfill in progress or not started.</div>';
+  // log
+  const lb=document.getElementById('logbox');
+  lb.textContent=(s.log||[]).join('\n'); lb.scrollTop=lb.scrollHeight;
+}
+async function runBackfill(){
+  try{ const r=await fetch('/api/run_backfill',{method:'POST'}); if(r.status===409) alert('Backfill already running'); }
+  catch(e){} refresh();
+}
+async function startRecorder(){
+  try{ const r=await fetch('/api/start_recorder',{method:'POST'}); if(r.status===409) alert('Recorder already running'); }
+  catch(e){} refresh();
+}
+refresh(); setInterval(refresh, 3000);
+</script>
+</body>
+</html>
