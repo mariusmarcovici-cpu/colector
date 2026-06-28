@@ -18,7 +18,7 @@ ENV (all optional):
 NOTE: the network fetches require open egress (Binance / Polymarket). They run fine on Railway;
 they cannot run in a sandbox locked to package registries.
 """
-import os, io, json, time, threading, asyncio, http.server, socketserver, urllib.parse, zipfile, glob
+import os, io, json, time, threading, asyncio, http.server, socketserver, urllib.parse, zipfile, glob, tempfile
 
 import binance_backfill as BB
 import polymarket as PM
@@ -101,42 +101,24 @@ def list_files():
     return files
 
 
-def stream_zip_to(fp):
-    """Write a zip of all collected files DIRECTLY to fp (the response stream) — never buffered in RAM,
-    never staged on disk. zipfile falls back to streaming mode (data descriptors) on a non-seekable
-    socket, so this handles GB-scale aggTrades without OOM. Returns nothing; raises on a broken pipe."""
-    with zipfile.ZipFile(fp, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+def build_zip_to_tempfile():
+    """Build a zip of all collected files into a TEMP FILE on disk, then return its path + size.
+
+    Why a temp file and not streaming: the previous version hand-rolled HTTP chunked-transfer framing
+    straight into the socket. Python's http.server does not guarantee the client sees a clean chunked
+    *decode*, so the chunk-size markers leaked into the saved bytes and corrupted the zip. Building to a
+    real temp file lets us serve with a correct Content-Length and ZERO transfer framing — the bytes the
+    client saves are exactly the zip. It is written incrementally (ZipFile streams each member through),
+    so memory stays flat even for GB-scale aggTrades; only disk is used, then the temp file is removed.
+    """
+    fd, tmp = tempfile.mkstemp(prefix="amsa_bundle_", suffix=".zip", dir=CFG["data_dir"])
+    os.close(fd)
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as z:
         for f in list_files():
-            if f["name"] in ("_bundle.zip",):   # never zip a stray bundle into itself
+            if f["name"].startswith("amsa_bundle_"):   # never zip a stray bundle into itself
                 continue
             z.write(os.path.join(CFG["data_dir"], f["name"]), f["name"])
-
-
-class _ChunkedWriter:
-    """Wrap the response wfile and emit valid HTTP/1.1 chunked-transfer framing for each write().
-    Lets us stream a zip of unknown total size (no Content-Length) without buffering it. Must call
-    close() to emit the terminating 0-length chunk. zipfile only calls write()/flush()/close()."""
-    def __init__(self, wfile):
-        self.w = wfile
-        self.closed = False
-    def write(self, data):
-        if not data:
-            return 0
-        if isinstance(data, str):
-            data = data.encode()
-        self.w.write(f"{len(data):X}\r\n".encode())
-        self.w.write(data)
-        self.w.write(b"\r\n")
-        return len(data)
-    def flush(self):
-        try: self.w.flush()
-        except Exception: pass
-    def close(self):
-        if self.closed:
-            return
-        self.closed = True
-        self.w.write(b"0\r\n\r\n")   # terminating chunk
-        self.flush()
+    return tmp, os.path.getsize(tmp)
 
 
 # ----------------------------------------------------------------- HTTP server
@@ -186,15 +168,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(404, json.dumps({"error": "not found"}))
         elif path == "/api/download_all":
             stamp = time.strftime("%Y-%m-%d_%H%MZ", time.gmtime())
+            tmp = None
             try:
+                tmp, size = build_zip_to_tempfile()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/zip")
                 self.send_header("Content-Disposition", f'attachment; filename="amsa_data_{stamp}.zip"')
-                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Content-Length", str(size))   # real length -> no transfer framing, clean bytes
                 self.end_headers()
-                stream_zip_to(_ChunkedWriter(self.wfile))   # streams as it builds — no RAM/disk staging
+                with open(tmp, "rb") as zf:
+                    while True:
+                        chunk = zf.read(1024 * 256)   # 256KB disk reads -> flat memory, plain socket writes
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
             except (BrokenPipeError, ConnectionResetError):
-                pass   # client cancelled the download; nothing to clean up
+                pass   # client cancelled the download
+            except Exception as e:
+                log(f"[collector] download_all ERROR: {e}")
+            finally:
+                if tmp and os.path.exists(tmp):
+                    try: os.remove(tmp)
+                    except OSError: pass
         else:
             self._send(404, json.dumps({"error": "unknown route"}))
 

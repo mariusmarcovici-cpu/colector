@@ -26,6 +26,25 @@ KLINE_COLS = ["open_time","open","high","low","close","volume","close_time",
 AGG_COLS = ["agg_id","price","qty","first_id","last_id","ts","is_buyer_maker","is_best_match"]
 
 
+def _to_ms(ts):
+    """Normalize any epoch timestamp to MILLISECONDS.
+
+    The binance.vision daily dumps give 13-digit ms timestamps. But the REST fallback mirror
+    (data-api.binance.vision) has been observed to return 16-digit MICROSECOND timestamps for some
+    1s-kline / aggTrade rows. Feeding those into //60000 minute math throws windows to the year 58450
+    and silently produces zero 5-min windows. Collapse anything coarser than ms down to ms by powers of
+    1000, so dump rows (ms) and REST rows (µs or ns) all land on the same scale.
+    """
+    try:
+        v = int(ts)
+    except (ValueError, TypeError):
+        return None
+    # a current epoch in ms is ~1.7e12 (13 digits). µs ~1.7e15 (16), ns ~1.7e18 (19).
+    while v > 5_000_000_000_000:   # > ~year 2128 in ms => too big, must be finer-grained
+        v //= 1000
+    return v
+
+
 def _http_get(url, timeout=60):
     req = urllib.request.Request(url, headers={"User-Agent": "amsa-data-collector/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -163,11 +182,14 @@ def derive_5min_summary(klines_1m, aggtrades, save_path):
        open, close, outcome(UP/DOWN), range_bps, realized_vol_bps, cvd_delta, n_trades, directionality, regime.
        outcome = Binance-kline approximation of how a btc-updown-5m market would resolve (close vs open of window).
        directionality = |close-open| / (high-low): ~1 = clean trend, ~0 = chop. regime tags off that + vol."""
-    # index 1m klines by open_time(ms) -> (o,h,l,c,vol)
+    # index 1m klines by open_time(ms) -> (o,h,l,c,vol). Normalize ts to ms (REST fallback may give µs).
     kl = {}
     for r in klines_1m:
         try:
-            kl[int(r[0])] = (float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
+            t = _to_ms(r[0])
+            if t is None:
+                continue
+            kl[t] = (float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
         except (ValueError, IndexError):
             continue
     if not kl:
@@ -177,7 +199,9 @@ def derive_5min_summary(klines_1m, aggtrades, save_path):
     trd_min = defaultdict(int)
     for r in aggtrades or []:
         try:
-            px = float(r[1]); qty = float(r[2]); ts = int(r[5])
+            px = float(r[1]); qty = float(r[2]); ts = _to_ms(r[5])
+            if ts is None:
+                continue
             maker = str(r[6]).lower() in ("true", "1")
         except (ValueError, IndexError):
             continue
@@ -185,54 +209,57 @@ def derive_5min_summary(klines_1m, aggtrades, save_path):
         cvd_min[minute] += (-qty if maker else qty) * px   # signed notional
         trd_min[minute] += 1
 
-    times = sorted(kl.keys())
-    if not times:
+    if not kl:
         return []
-    # align windows to 5-min grid
-    start = times[0] - (times[0] % 300000)
-    end = times[-1]
+    # Bucket every 1m kline into its ABSOLUTE-UTC 5-min window: floor(open_time / 300000) * 300000.
+    # The old code anchored the grid to the FIRST row's offset, so non-contiguous days (gaps in coverage)
+    # mis-stitched and emitted zero windows. Absolute anchoring is gap-proof and order-independent: each
+    # minute lands in its true wall-clock 5-min slot regardless of what else is present.
+    by_window = defaultdict(list)
+    for t in kl:
+        by_window[t - (t % 300000)].append(t)
+
     rows = []
-    t = start
-    while t <= end:
-        mins = [t + 60000 * i for i in range(5)]
-        present = [m for m in mins if m in kl]
-        if len(present) >= 3:   # need most of the window
-            o = kl[present[0]][0]
-            c = kl[present[-1]][3]
-            hi = max(kl[m][1] for m in present)
-            lo = min(kl[m][2] for m in present)
-            rets = []
-            for i in range(1, len(present)):
-                p0 = kl[present[i-1]][3]; p1 = kl[present[i]][3]
-                if p0 > 0:
-                    rets.append((p1 - p0) / p0)
-            rng = hi - lo
-            rv = (sum(x*x for x in rets) / len(rets)) ** 0.5 if rets else 0.0
-            cvd = sum(cvd_min.get(m, 0.0) for m in mins)
-            ntr = sum(trd_min.get(m, 0) for m in mins)
-            direction = abs(c - o) / rng if rng > 0 else 0.0
-            move_bps = (c - o) / o * 1e4 if o > 0 else 0.0
-            # regime heuristic: clean directional move = TREND; lots of range but little net move = CHOP
-            if direction >= 0.55 and abs(move_bps) >= 4:
-                regime = "TREND"
-            elif direction <= 0.30:
-                regime = "CHOP"
-            else:
-                regime = "MIXED"
-            rows.append({
-                "window_start_ms": t,
-                "window_start_utc": dt.datetime.fromtimestamp(t/1000, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                "open": round(o, 2), "close": round(c, 2),
-                "outcome": "UP" if c > o else "DOWN",
-                "move_bps": round(move_bps, 2),
-                "range_bps": round(rng / o * 1e4, 2) if o > 0 else 0.0,
-                "realized_vol_bps": round(rv * 1e4, 2),
-                "cvd_delta_usd": round(cvd, 0),
-                "n_trades": ntr,
-                "directionality": round(direction, 3),
-                "regime": regime,
-            })
-        t += 300000
+    for w in sorted(by_window):
+        mins = [w + 60000 * i for i in range(5)]
+        present = sorted(m for m in mins if m in kl)
+        if len(present) < 3:   # need most of the window
+            continue
+        o = kl[present[0]][0]
+        c = kl[present[-1]][3]
+        hi = max(kl[m][1] for m in present)
+        lo = min(kl[m][2] for m in present)
+        rets = []
+        for i in range(1, len(present)):
+            p0 = kl[present[i-1]][3]; p1 = kl[present[i]][3]
+            if p0 > 0:
+                rets.append((p1 - p0) / p0)
+        rng = hi - lo
+        rv = (sum(x*x for x in rets) / len(rets)) ** 0.5 if rets else 0.0
+        cvd = sum(cvd_min.get(m, 0.0) for m in mins)
+        ntr = sum(trd_min.get(m, 0) for m in mins)
+        direction = abs(c - o) / rng if rng > 0 else 0.0
+        move_bps = (c - o) / o * 1e4 if o > 0 else 0.0
+        # regime heuristic: clean directional move = TREND; lots of range but little net move = CHOP
+        if direction >= 0.55 and abs(move_bps) >= 4:
+            regime = "TREND"
+        elif direction <= 0.30:
+            regime = "CHOP"
+        else:
+            regime = "MIXED"
+        rows.append({
+            "window_start_ms": w,
+            "window_start_utc": dt.datetime.fromtimestamp(w/1000, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "open": round(o, 2), "close": round(c, 2),
+            "outcome": "UP" if c > o else "DOWN",
+            "move_bps": round(move_bps, 2),
+            "range_bps": round(rng / o * 1e4, 2) if o > 0 else 0.0,
+            "realized_vol_bps": round(rv * 1e4, 2),
+            "cvd_delta_usd": round(cvd, 0),
+            "n_trades": ntr,
+            "directionality": round(direction, 3),
+            "regime": regime,
+        })
     if rows:
         with open(save_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
